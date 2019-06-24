@@ -2,17 +2,23 @@
 # coding: utf-8
 
 import unicodedata
-import os, sys
-from time import sleep
+import os, sys, signal
+from time import sleep, time
 import traceback
 import threading
 import platform
 from serviceProviderLib import socketServer, socketClient, gmailBox
-from serviceProviderLib import logFacility, timer, dateTime, internet_on
-from serviceProviderLib import shellCommand, humanize_duration
+from serviceProviderLib import logFacility, timer, dateTime, internet_on, runInBack
+from serviceProviderLib import shellCommand, humanize_duration, dateMath, timeIt
+import json
+from datetime import datetime
+import math
+from operator import itemgetter
 
 from inspect import stack
-
+import ssl
+import ast
+from itertools import cycle
 
 ################################################################################################################         
 ## class for creating a service provider using sockets - tested on Ubuntu, Raspbian                           ##         
@@ -21,8 +27,8 @@ from inspect import stack
 class serviceProvider():
 
    HOMEPATH = '/tmp'
-   PORT = 3533
-   SERVICENAME_VERSION = '0.1.2'
+   PORT = 9095
+   SERVICENAME_VERSION = '0.1'
 
 #HISTORY OF CHANGES
 #  0.1    creation
@@ -30,8 +36,9 @@ class serviceProvider():
 #  0.1.2  change naming from tcpserver to serviceProvider (generic)
 
 #-------------------------------------------------------------------------------------------------------------------
-   def __init__(self, host='0.0.0.0', port=None, bufferSize=10*1024, homePath=None, serviceName='tcpServer', verbose = False, debug=False):
+   def __init__(self, host='0.0.0.0', port=None, bufferSize=10*1024, homePath=None, serviceName='tcpServer', dbServer = ('0.0.0.0',7075), appServersInfo = [('0.0.0.0',7080),('0.0.0.0',7081),('0.0.0.0',7082),('0.0.0.0',7083),('0.0.0.0',7084)], verbose = False, debug=False):
 #-------------------------------------------------------------------------------------------------------------------
+      
       self.pid = os.getpid()
       self.arch = platform.machine()
       self.errorMessage = ''
@@ -48,22 +55,30 @@ class serviceProvider():
       self.header = False
       self.time2saveContext = 10
       self.module = self.serviceName
+      ssl._create_default_https_context = ssl._create_unverified_context
+      
+      self.adminEmail = 'alejandro.dirgan@gmail.com'
+      
+      self.date = dateMath()
       
       self.lockTcpServer = threading.Lock()
-      
-      self.timers = timer()
+            
       self.uptime = dateTime()
       self.uptime.startTimer()
       self.host=host
-
-
-      self.avoidCharsArray = ["'","(",")","[","]","{","}","<",">",",",".","?","^","%","$","#","@","!","|",":",";","~"," -",'"']
       
-      self.gmail=gmailBox("alejandro.dirgan@gmail.com","ARG5bfPQ67680512");
-      self.gmail.setVerbose(verbose=False)
+      self.pageSize = 20
+      
+      self.somethingToWrite = False
+
+            
+      self.avoidCharsArray = ["'","(",")","[","]","{","}","<",">",",",".","?","^","%","$","#","@","!","|",":",";","~"," -",'"']
       
       self.logFile = self.home + '/%s.log'%self.serviceName
       self.log = logFacility(module=self.serviceName, logFile = self.logFile )
+
+      self.errorLogFile = self.home + '/%s.errors.log'%self.serviceName
+      self.errorLog = logFacility(module=self.serviceName, logFile = self.logFile )
 
       if os.path.isfile(self.finishFile): 
          shellCommand('rm %s'%(self.finishFile)).run()
@@ -72,17 +87,17 @@ class serviceProvider():
          processCount = int(i)
          
       if processCount > 2: 
-         self._logMessage('(init) there is another instance of %s running... exiting'%(self.serviceName), verbose = True) 
+         print '(init) there is another instance of %s running... exiting'%(self.serviceName)
          exit(1)
          
       if port == None:
          self.port = self.PORT
       else:
          if port < 1000 or port > 9999:   
-            self.errorMessage = 'port number needs to be in range of 1000 - 9999'
+            self.errorMessage = 'port number have to be in range of 1000 - 9999'
             self.errorCode = 1004
             self.error = True
-            self._logMessage(self.errorMessage, severity='ERROR', verbose = True) 
+            print self.errorMessage
             exit(1)
          else:
             self.port = port   
@@ -93,21 +108,22 @@ class serviceProvider():
          self.errorMessage = 'home directory %s does not exists'%self.home
          self.errorCode = 1001
          self.error = True
-         self._logMessage(self.errorMessage, verbose = True) 
+         print self.errorMessage
          exit(1)
 
       if not os.path.isfile(self.initFile): #or forceStart:
          shellCommand('echo %s > %s'%(self.pid,self.initFile)).run()
       else:
-         self._logMessage('(init) %s is running or is in a unestable state...\n(init) Stop the process or remove using rm %s'%(self.serviceName,self.initFile), verbose = True) 
+         print '(init) %s is running or is in a unestable state...\n(init) Stop the process or rm %s'%(self.serviceName,self.initFile)
          exit(1)
       
-      self._logMessage('(init) starting %s!'%self.serviceName, verbose = True) 
-      self._logMessage('(init) home directory is %s'%(self.home), verbose = True) 
+      print '(init) starting %s!'%self.serviceName
+      print '(init) home directory is %s'%(self.home)
 
 
       if '(OK)' in socketClient(host=self.host,port=self.port,command='about')[0]:
-         self._logMessage('(init) there is another instance of %s running... exiting'%(self.serviceName), verbose = True) 
+         print '(init) there is another instance of %s running... exiting'%(self.serviceName)
+         shellCommand('rm %s'%self.initFile).run() 
          exit(1)
          
       self.bufferSize = bufferSize
@@ -120,24 +136,37 @@ class serviceProvider():
 
       self.defineMessages()
 
-      self._logMessage('(init) listening on port %s'%self.port, verbose = True) 
-      self._logMessage('(init) this process is identified by: %s'%self.pid, verbose = True) 
+      try:
+         print '(init) authenticating on mail provider'
+         self.mail=gmailBox("alejandro.dirgan@gmail.com","ARG5bfPQ67680512");
+         self.mail.setVerbose(verbose=False)
+         print '(init) email authentication done!'
+      except:
+         print "Problems accessing Internet... please check it out and try again"
+         shellCommand('rm %s'%self.initFile).run() 
+         exit(1)
+
+      print '(init) listening on port %s'%self.port
+      print '(init) this process is identified by: %s'%self.pid
 
       self.socketServer = socketServer(host=self.host, port=self.port) 
       self.socketServer.setBehavior(self.tcpServer).start(inBackground=True)
-            
-      self.eventLoop()      
+
+      self.returnStats = {
+         "host":host,
+         "port":port,
+      }
 
 #------------------------------------------------   
-   def removeChars(self, string, chars):
+   def start(self):
 #------------------------------------------------   
-      returnValue = string
-		
-      for i in chars: 
-         returnValue=returnValue.replace(i,"")
-		
-      return returnValue   
-		
+      self.eventLoop()      
+
+#-------------------------------------------------------------------------------------------------------------------
+   def _logError(self, message):
+#-------------------------------------------------------------------------------------------------------------------
+         self.errorLog.logMessage(message)
+
 #-------------------------------------------------------------------------------------------------------------------
    def _logMessage(self, message, user = None, verbose = False):
 #-------------------------------------------------------------------------------------------------------------------
@@ -152,22 +181,14 @@ class serviceProvider():
 #-------------------------------------------------------------------------------------------------------------------
       self.helpMessage = {
       
-      'about'                  : 'USAGE: about [help]\n',
-      'headeron'               : 'USAGE: headerOn [help]\n',
-      'headeroff'              : 'USAGE: headerOff [help]\n',
-      'getheader'              : 'USAGE: getHeader [help]\n',
-      'debugon'                : 'USAGE: debugOn [help]\n',
-      'debugoff'               : 'USAGE: debugOff [help]\n',
-      'getdebug'               : 'USAGE: getDebug [help]\n',
-      'verboseon'              : 'USAGE: verboseOn [help]\n',
-      'verboseoff'             : 'USAGE: verboseOff [help]\n',
-      'getverbose'             : 'USAGE: getVerbose [help]\n',
-      'restart'                : 'USAGE: restart [help]\n',
-      'getpid'                 : 'USAGE: getPid [help]\n',
-      'commands'               : 'USAGE: commands [filter=word] [help]\n',
-     
+      'about'                             : 'USAGE: about [help]\n',
+      'uptime'                            : 'USAGE: uptime [help]\n',
+      'getpid'                            : 'USAGE: getPid token=secret | [help]\n',
+      'commands'                          : 'USAGE: commands [filter=word] [help]\n',
+      'help'                              : 'USAGE: help [filter=word] [help]\n',
+      'stop'                              : 'USAGE: stop [help]\n',
+      'getstats'                          : 'USAGE: getStats [help]\n',
       }
-      
       
       self.severity  = { 'ok': '(OK)',
                          'info': '(INFO)',
@@ -176,6 +197,19 @@ class serviceProvider():
                          'panic': '(PANIC)',
                         }
       
+#-------------------------------------------------------------------------------------------------------------------
+   def isAppServerAlive(self, appServerInfo=('0.0.0.0', 7080)):
+#-------------------------------------------------------------------------------------------------------------------
+		returnValue = False
+		
+		try:
+			_appServer = ast.literal_eval(socketClient(host=appServerInfo[0],port=appServerInfo[1],command="about ")[0])
+			if _appServer['status'] == '(OK)': returnValue = True
+		except:
+			pass
+
+		return returnValue
+
 #-------------------------------------------------------------------------------------------------------------------
    def getError(self):
 #-------------------------------------------------------------------------------------------------------------------
@@ -190,50 +224,69 @@ class serviceProvider():
    def check4ExitFile(self):
 #-------------------------------------------------------------------------------------------------------------------
       if os.path.exists(self.finishFile):
+         self.tcpServerExit = True
          shellCommand('rm %s'%self.finishFile).run()
          self.stopServer(0,0)
 
 #-------------------------------------------------------------------------------------------------------------------
    def eventLoop(self):
 #-------------------------------------------------------------------------------------------------------------------
-      self.updateDB = True
-      self._logMessage('(eventLoop) entering event loop!', verbose = True) 
-            
-      self.countSongs = 1
+	self.updateDB = True
+	print '(eventLoop) entering event loop!'
+		
+	self.countSongs = 1
 
-      songPercent = 0         
+	songPercent = 0         
+
+	self.artist = ''
+
+	#~ self.timers.startTimer(timerId='commitUserDB')
       
-      self.artist = ''
+	while not self.tcpServerExit:
+		self.lockTcpServer.acquire()
+		try:         
+			pass
+			
+			########## CHECK DB SERVER ---- moved to ECNewsMonitor
+			#~ if self.timers.trigger(timerId='checkDBServer'):
+				#~ runInBack(self.checkDBServer).start()
+				#~ self.timers.startTimer(timerId='checkDBServer')
+          
+		except Exception as pythonError: 
+			print "(eventLoop) Error:"
+			if self.debug: print traceback.format_exc()
+		finally:
+			self.lockTcpServer.release()
          
-      while not self.tcpServerExit:
-         self.lockTcpServer.acquire()
-         try:         
-                                    
-            self.check4ExitFile()
-           
-         except Exception as pythonError: 
-            if self.debug: print(traceback.format_exc()) 
-         finally:
-            self.lockTcpServer.release()
-         
-         sleep(self.loopDelay)   
+		sleep(self.loopDelay)   
 
       #*** END OF Eventloop
 
-      self._logMessage('(eventLoop) %s is stopped!'%self.serviceName, verbose = True) 
+	print '(eventLoop) %s has been stopped gracefully!'%self.serviceName
+	
       
-        
+#-------------------------------------------------------------------------------------------------------------------
+   def Jsonize(self, _status, _response):
+#-------------------------------------------------------------------------------------------------------------------
+      rvalue = {'status':_status,'response':_response}
+      return json.dumps(rvalue)+'\n'
+
+#-------------------------------------------------------------------------------------------------------------------
+   def doStopServer(self):
+#-------------------------------------------------------------------------------------------------------------------
+		self.stopServer(0,0)
+
 #-------------------------------------------------------------------------------------------------------------------
    def stopServer(self, signum, frame):
 #-------------------------------------------------------------------------------------------------------------------
-      self._logMessage('(stopServer) stopping %s after %s'%(self.serviceName,humanize_duration(self.uptime.timeLapsed())), verbose = True) 
+      print '(stopServer) stopping %s after %s'%(self.serviceName,humanize_duration(self.uptime.timeLapsed()))
 
       self.socketServer.stop()
       
       if os.path.isfile(self.initFile): #or forceStart:
          shellCommand('rm %s'%self.initFile).run()
       else:
-         self._logMessage('(init) control file %s was not found'%(self.serviceName,self.initFile), verbose = True) 
+         print '(init) control file %s was not found'%(self.serviceName,self.initFile)
          exit(1)
 
       self.tcpServerExit = True
@@ -245,7 +298,7 @@ class serviceProvider():
          try: 
             fpars[key] = pars[key].replace('#',' ')
          except Exception as pythonError: 
-            if self.debug: print(traceback.format_exc()) 
+            if self.debug: self.errorLog(traceback.format_exc())
             fpars[key] = ''
 
 #-------------------------------------------------------------------------------------------------------------------
@@ -262,7 +315,7 @@ class serviceProvider():
       try:
          try:
             if self.debug:
-               self._logMessage('(tcpServer) processing requirement', verbose = self.verbose) 
+               print '(tcpServer) processing requirement'
 
             parameters = {}
 
@@ -285,14 +338,14 @@ class serviceProvider():
             
          
             if self.debug:
-               self._logMessage('(tcpServer) command %s'%cmd, verbose = self.verbose) 
-               self._logMessage('(tcpServer) parameters %s'%parameters, verbose = self.verbose) 
+               print '(tcpServer) command %s'%cmd
+               print '(tcpServer) parameters %s'%parameters
 
-            returnValue = self.executeCommand(cmd,parameters)
+            returnValue = self.executeCommandProcedure(cmd,parameters)
    
          except Exception as pythonError: 
-            if self.debug: print(traceback.format_exc()) 
-            self._logMessage('(tcpServer) command error: %s\n'%pythonError, severity='ERROR', verbose = self.verbose)             
+            if self.debug: self.errorLog(traceback.format_exc())
+            print '(tcpServer) command error: %s\n'%pythonError
             returnValue = '%s command not executed\n'%(self.severity['error'])
 
       finally:
@@ -301,20 +354,12 @@ class serviceProvider():
       return returnValue
       
 #-------------------------------------------------------------------------------------------------------------------
-   def executeCommand(self, command, parameters):
+   def executeCommandProcedure(self, command, parameters):
 #-------------------------------------------------------------------------------------------------------------------
       #this is the behavior section of the service provider
       #in this section we can add functionality
       #  first, create an elif command subsection
       #  elif command == "command_name": where command_name must be in lowercase
-      
-      
-      #
-      #
-      #
-      #
-      #
-      #
       
       command = command.replace("'",'').lower()
       returnValue = ''
@@ -337,116 +382,72 @@ class serviceProvider():
             try: 
                returnValue = self.helpMessage[command]
             except Exception as pythonError:
-               if self.debug: print(traceback.format_exc()) 
-               returnValue = 'help not available for <command> %s\n'%command     
+               if self.debug: self.errorLog(traceback.format_exc())
+               returnValue = self.Jsonize(self.severity['error'],'help not available for <command> %s'%command)
+                
             return returnValue
       except Exception as pythonError: 
          pass
          #if self.debug: print(traceback.format_exc()) 
          
-            
-      #self._logMessage('(executeCommand) responding to keyword <%s>'%command, user = self.musicMngt.getActiveUser(), verbose = self.verbose) 
-
       ################################# 
       ################################# Help Commands
       #################################
       ########################################################################################
       if command == 'about': 
+         if not executeCommandError and executeCommand:
+            returnValue = self.Jsonize(self.severity['ok'],self.version)
+
+      ########################################################################################
+      elif command == 'uptime': 
+         if not executeCommandError and executeCommand:
+            returnValue = self.Jsonize(self.severity['ok'],humanize_duration(self.uptime.timeLapsed()))
+
+      ########################################################################################
+      elif command == 'stop': 
 
          if not executeCommandError and executeCommand:
-            returnValue = '%s [%s]\n'%(self.severity['ok'],self.version)
+            self.stopServer(0,0)
+            returnValue = '%s\n'%self.severity['ok']
+
+      ########################################################################################
+      elif command == 'getstats': 
+         self.returnStats["uptime"] = humanize_duration(self.uptime.timeLapsed())   
+         if not executeCommandError and executeCommand:
+            try:
+               returnValue = self.Jsonize(self.severity['ok'],{'stats':self.returnStats})
+            except:
+               print traceback.format_exc()
 
       ########################################################################################
       elif command == '': 
-
          if not executeCommandError and executeCommand:
-            returnValue = '%s\n'%self.severity['ok']
+            returnValue = self.Jsonize(self.severity['ok'],'OK')
          
       ########################################################################################
       elif command == 'commands': 
-         returnValue = ''
+         _result = {}
          commandName = ''
          commandParameters = []
 
          try: 
             _filter = parameters['filter']
          except Exception as pythonError: 
-            if self.debug: print(traceback.format_exc()) 
             _filter=''
          
          for key in sorted(self.helpMessage): 
             if _filter in key:
                commandName = self.helpMessage[key].split('USAGE: ')[1].split()[0]
-               commandParameters = self.helpMessage[key].split('USAGE: ')[1].split()[1:]
-               returnValue += '%25s : %s\n'%(commandName,''.join(commandParameters))
+               commandParameters = self.helpMessage[key].split('USAGE: ')[1].replace("\n","")
+               _result[commandName] = commandParameters
+               
+         returnValue = self.Jsonize(self.severity['ok'],{"commands":_result})
    
-      ########################################################################################
-      elif command == 'verboseoff': 
-
-         if not executeCommandError and executeCommand:
-            self.verbose = False
-            returnValue = '%s setting verbose [Off]\n'%(self.severity['ok'])
-
-      ########################################################################################
-      elif command == 'verboseon': 
-
-         if not executeCommandError and executeCommand:
-            self.verbose = True
-            returnValue = '%s setting verbose [On]\n'%(self.severity['ok'])
-
-      ########################################################################################
-      elif command == 'getverbose': 
-         try:
-            if self.verbose:
-               returnValue = '%s On\n'%(self.severity['ok']) 
-            else:
-               returnValue = '%s Off\n'%(self.severity['ok']) 
-         except Exception as pythonError: 
-            if self.debug: print(traceback.format_exc()) 
-            executeCommandError = True  
-            returnValue = '%s <%s> not executed\n'%(self.severity['error'], command)
-
-      ########################################################################################
-      elif command == 'debugon': 
-
-         if not executeCommandError and executeCommand:
-            self.debug = True
-            returnValue = '%s setting debug [On]\n'%(self.severity['ok'])
-
-      ########################################################################################
-      elif command == 'debugoff': 
-
-         if not executeCommandError and executeCommand:
-            self.debug = False
-            returnValue = '%s setting debug [Off]\n'%(self.severity['ok'])
-
-      ########################################################################################
-      elif command == 'getdebug': 
-         try:
-            if self.debug:
-               returnValue = '%s On\n'%(self.severity['ok']) 
-            else:
-               returnValue = '%s Off\n'%(self.severity['ok']) 
-         except Exception as pythonError: 
-            if self.debug: print(traceback.format_exc()) 
-            executeCommandError = True  
-            returnValue = '%s <%s> not executed\n'%(self.severity['error'], command)
-
-      ########################################################################################
-      elif command == 'restart': 
-         returnValue = '%s not implemented\n'%self.severity['ok']
-
-         #if not executeCommandError and executeCommand:
-         #   returnValue = '%s restarting...\n'%(self.severity['info'])
-         #   shellCommand('rm %s'%self.initFile).run()
-         #   self.saveContext()   
-         #   os.execl('/home/ydirgan/python/musicServer','musicServerd', 'restart')
-
       ########################################################################################
       elif command == 'getpid': 
 
          if not executeCommandError and executeCommand:
-            returnValue = '%s pid [%s]\n'%(self.severity['ok'],self.pid)
+            returnValue = self.Jsonize(self.severity['ok'],self.pid)
 
       ########################################################################################
       #elif command == 'new_behavior_command':
@@ -464,12 +465,12 @@ class serviceProvider():
       #      activeVars['parameter_name_1'] = parameters['parameter_name_1'].replace(self.spaceSeparator,' ') #or
       #      #param_1 = parameters['parameter_name_1'].replace(self.spaceSeparator,' ')
       #   except Exception as pythonError: 
-      #      activeVars['parameter_name_1'] = None OR executeCommand=False OR returnValue = self.helpMessage[command]
+      #      activeVars['parameter_name_1'] = None OR executeCommand=False
 
       #   try: 
       #      activeVars['parameter_name_n'] = parameters['parameter_name_n'].replace(self.spaceSeparator,' ')
       #   except Exception as pythonError: 
-      #      activeVars['parameter_name_n'] = None OR executeCommand=False OR returnValue = self.helpMessage[command]
+      #      activeVars['parameter_name_n'] = None OR executeCommand=False
 
       #   try:
       #      -- parameters are in activeVars list or volatile variables
@@ -487,7 +488,7 @@ class serviceProvider():
       else: 
          executeCommandError = True  
          executeCommandString = '(tcpServer) unknown command <%s>'%command
-         returnValue = '%s unknown command\n'%(self.severity['error']) 
+         returnValue = self.Jsonize(self.severity['error'],'unknown command')
       
       if self.verbose and executeCommandError: 
          if executeCommandString == '':
@@ -497,6 +498,10 @@ class serviceProvider():
       
       return returnValue
 
+##########################################################
+def stopServerHandler(signum, frame):
+	print 'Stopping Server with Ctrl-C'
+	stopServer()
 
 ##########################################################
 ### BEGIN MAIN          ##################################
@@ -505,11 +510,16 @@ class serviceProvider():
 #--------------------------------------------------------      
 def printBanner():
    print '''
-                  _        ___             _    _         
-  ___ ___ _ ___ _(_)__ ___| _ \_ _ _____ _(_)__| |___ _ _ 
- (_-</ -_) '_\ V / / _/ -_)  _/ '_/ _ \ V / / _` / -_) '_|
- /__/\___|_|  \_/|_\__\___|_| |_| \___/\_/|_\__,_\___|_|  
- 
+  _____          _   _    _       _   
+ |  __ \        | | | |  | |     | |  
+ | |__) |___  __| | | |__| | __ _| |_ 
+ |  _  // _ \/ _` | |  __  |/ _` | __|
+ | | \ \  __/ (_| | | |  | | (_| | |_ 
+ |_|  \_\___|\__,_| |_|  |_|\__,_|\__|
+
+  Service Provider Demo
+  Alejandro Dirgan 2019              
+                
 '''
    
 #--------------------------------------------------------      
@@ -522,7 +532,7 @@ if __name__ == '__main__':
    
    _defaultPort = 9095
    _defaultHome = '/tmp'
-   _defaultServiceName = 'genericServiceProvider'
+   _defaultServiceName = 'serviceProvider'
    
    for arg in sys.argv:
       if 'help' in arg.lower():
@@ -596,10 +606,15 @@ if __name__ == '__main__':
       print '--------------------------------------------------------------------------'
       print 'INFO:'
       print '--------------------------------------------------------------------------'
-      server = serviceProvider(port=_port, homePath=_homeDir, serviceName=_serviceName, verbose=_verbose)
+      server = serviceProvider(port=_port, homePath=_homeDir, serviceName=_serviceName, verbose=_verbose, debug=False)
+
+      global stopServer
+      stopServer = server.doStopServer
+      signal.signal(signal.SIGINT, stopServerHandler)
+      
+      server.start()
 
    except Exception as pythonError: 
       print(traceback.format_exc()) 
       
-
 
