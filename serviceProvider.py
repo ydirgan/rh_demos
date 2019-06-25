@@ -154,6 +154,7 @@ class serviceProvider():
 
       self.returnStats = {
          "host":socket.gethostbyname_ex(socket.gethostname())[0],
+         "ip":socket.gethostbyname_ex(socket.gethostname())[2],
          "port":port,
       }
 
