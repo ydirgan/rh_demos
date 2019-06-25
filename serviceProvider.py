@@ -10,7 +10,7 @@ import platform
 from serviceProviderLib import socketServer, socketClient, gmailBox
 from serviceProviderLib import logFacility, timer, dateTime, internet_on, runInBack
 from serviceProviderLib import shellCommand, humanize_duration, dateMath, timeIt
-import json
+import json, socket
 from datetime import datetime
 import math
 from operator import itemgetter
@@ -153,7 +153,7 @@ class serviceProvider():
       self.socketServer.setBehavior(self.tcpServer).start(inBackground=True)
 
       self.returnStats = {
-         "host":host,
+         "host":socket.gethostbyname_ex(socket.gethostname())[0],
          "port":port,
       }
 
